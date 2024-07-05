@@ -1,0 +1,353 @@
+#!/usr/bin/env php
+<?php
+
+class VCR {
+	private $mode;
+	private $apiUrl;
+	private $tapeName;
+	private $tapesDir = 'tapes';
+	private $logFile = 'vcr_main_log.txt';
+
+	// ANSI color codes
+	private $red = "\033[0;31m";
+	private $green = "\033[0;32m";
+	private $yellow = "\033[0;33m";
+	private $reset = "\033[0m";
+
+	public function __construct() {
+		if (!is_dir($this->tapesDir)) {
+			mkdir($this->tapesDir, 0755, true);
+		}
+	}
+
+	private function log($message) {
+		file_put_contents($this->logFile, date('[Y-m-d H:i:s] ') . $message . PHP_EOL, FILE_APPEND);
+	}
+
+	public function run() {
+		$this->mode = $this->promptSelector("Select mode", ['record', 'playback']);
+		$this->apiUrl = $this->prompt("Enter the API URL (default: http://localhost:8000): ");
+		if (empty($this->apiUrl)) {
+			$this->apiUrl = "http://localhost:8000";
+		}
+
+		if ($this->mode === 'record') {
+			$this->tapeName = $this->prompt("Enter the tape name: ");
+			$this->record();
+		} elseif ($this->mode === 'playback') {
+			$this->tapeName = $this->selectTape();
+			if ($this->tapeName === null) {
+				echo "No tapes available or none selected. Exiting.\n";
+				exit(1);
+			}
+			echo "Starting playback...\n";
+			echo "--------------------\n";
+			$this->playback();
+		}
+	}
+
+	private function prompt($message) {
+		echo $message;
+		$input = fgets(STDIN);
+		return trim($input);
+	}
+
+	private function promptSelector($message, $options) {
+		echo $message . ":\n";
+		foreach ($options as $index => $option) {
+			echo ($index + 1) . ") $option\n";
+		}
+		$selection = $this->prompt("Enter your choice (1-" . count($options) . "): ");
+		$index = intval($selection) - 1;
+		if ($index >= 0 && $index < count($options)) {
+			return $options[$index];
+		} else {
+			echo "Invalid selection. Please try again.\n";
+			return $this->promptSelector($message, $options);
+		}
+	}
+
+	private function selectTape() {
+		$tapes = $this->listTapes();
+		if (empty($tapes)) {
+			echo "No tapes found in the '{$this->tapesDir}' directory.\n";
+			return null;
+		}
+
+		echo "Available tapes:\n";
+		foreach ($tapes as $index => $tape) {
+			echo ($index + 1) . ") $tape\n";
+		}
+
+		$selection = $this->prompt("Select a tape (1-" . count($tapes) . ") or enter a new tape name: ");
+		$index = intval($selection) - 1;
+		if ($index >= 0 && $index < count($tapes)) {
+			return $tapes[$index];
+		} elseif (!empty($selection)) {
+			return $selection;
+		} else {
+			echo "Invalid selection. Please try again.\n";
+			return $this->selectTape();
+		}
+	}
+
+	private function listTapes() {
+		$tapes = glob($this->tapesDir. '/*.json');
+		return array_map('basename', $tapes);
+	}
+
+	private function record() {
+		echo "Starting recording server...\n";
+		echo "Send your API requests to http://localhost:8080\n";
+		echo "Press Ctrl+C to stop recording.\n";
+
+		$command = sprintf(
+			'php -S localhost:8080 -t %s %s/record_server.php',
+			escapeshellarg(__DIR__),
+			escapeshellarg(__DIR__)
+		);
+
+		putenv("TAPE_NAME=" . $this->tapeName);
+		putenv("API_URL=" . $this->apiUrl);
+
+		passthru($command);
+	}
+
+	private function playback() {
+		$tapePath = $this->tapesDir . '/' . $this->tapeName;
+		if (!file_exists($tapePath)) {
+			echo "Tape file not found.\n";
+			exit(1);
+		}
+
+		$tape = json_decode(file_get_contents($tapePath), true);
+		if (json_last_error() !== JSON_ERROR_NONE) {
+			echo "Error reading tape file. It may be corrupted.\n";
+			exit(1);
+		}
+
+		$differences = [];
+
+		foreach ($tape as $interaction) {
+			$request = $interaction['request'];
+			$originalResponse = $interaction['response'];
+
+			$newResponse = $this->sendRequest(
+				$this->apiUrl . $request['url'],
+				$request['method'],
+				$request['headers'],
+				$request['data']
+			);
+
+			$comparison = $this->compareResponses($originalResponse, $newResponse);
+			$differences[] = [
+				'url' => $request['url'],
+				'method' => $request['method'],
+				'comparison' => $comparison
+			];
+		}
+
+		$this->displayResults($differences);
+	}
+
+	private function sendRequest($url, $method, $headers, $data) {
+		$options = [
+			'http' => [
+				'method' => $method,
+				'header' => $this->formatHeaders($headers),
+				'content' => $data,
+				'ignore_errors' => true,
+			]
+		];
+
+		$context = stream_context_create($options);
+		$result = @file_get_contents($url, false, $context);
+
+		if ($result === false) {
+			$error = error_get_last();
+			$this->log("Error in sendRequest: " . ($error['message'] ?? 'Unknown error'));
+			return [
+				'body' => "Error: " . ($error['message'] ?? 'Unknown error'),
+				'headers' => [],
+				'status' => 'HTTP/1.1 500 Internal Server Error'
+			];
+		}
+
+		return [
+			'body' => $result,
+			'headers' => $http_response_header,
+			'status' => $http_response_header[0] ?? 'HTTP/1.1 200 OK'
+		];
+	}
+
+	private function formatHeaders($headers) {
+		$formattedHeaders = [];
+		foreach ($headers as $key => $value) {
+			if (strtolower($key) !== 'host') {
+				$formattedHeaders[] = "$key: $value";
+			}
+		}
+		return implode("\r\n", $formattedHeaders);
+	}
+
+	private function compareResponses($response1, $response2) {
+		$bodyMatches = $response1['body'] === $response2['body'];
+		$headerComparison = $this->compareHeaders($response1['headers'], $response2['headers']);
+		$statusMatches = ($response1['status'] ?? '') === ($response2['status'] ?? '');
+
+		return [
+			'body_matches' => $bodyMatches,
+			'body_diff' => $bodyMatches ? null : $this->generateJsonDiff($response1['body'], $response2['body']),
+			'headers_match' => $headerComparison['match'],
+			'header_diff' => $headerComparison['diff'],
+			'status_match' => $statusMatches,
+			'status_diff' => $statusMatches ? null : [
+				'original' => $response1['status'] ?? '',
+				'new' => $response2['status'] ?? ''
+			]
+		];
+	}
+
+	private function compareHeaders($headers1, $headers2) {
+		$normalizedHeaders1 = $this->normalizeHeaders($headers1);
+		$normalizedHeaders2 = $this->normalizeHeaders($headers2);
+
+		$diff = [];
+		$allKeys = array_unique(array_merge(array_keys($normalizedHeaders1), array_keys($normalizedHeaders2)));
+
+		foreach ($allKeys as $key) {
+			if (!isset($normalizedHeaders1[$key])) {
+				$diff[] = $this->green . "+ $key: {$normalizedHeaders2[$key]}" . $this->reset;
+			} elseif (!isset($normalizedHeaders2[$key])) {
+				$diff[] = $this->red . "- $key: {$normalizedHeaders1[$key]}" . $this->reset;
+			} elseif ($normalizedHeaders1[$key] !== $normalizedHeaders2[$key]) {
+				$diff[] = $this->yellow . "* $key: {$normalizedHeaders1[$key]} => {$normalizedHeaders2[$key]}" . $this->reset;
+			}
+		}
+
+		return [
+			'match' => $normalizedHeaders1 === $normalizedHeaders2,
+			'diff' => $diff
+		];
+	}
+
+	private function normalizeHeaders($headers) {
+		$normalized = [];
+		foreach ($headers as $header) {
+			$parts = explode(':', $header, 2);
+			if (count($parts) === 2) {
+				$key = strtolower(trim($parts[0]));
+				$value = trim($parts[1]);
+				if (!in_array($key, ['host', 'date', 'server'])) {
+					$normalized[$key] = $value;
+				}
+			}
+		}
+		ksort($normalized);
+		return $normalized;
+	}
+
+	private function generateJsonDiff($json1, $json2) {
+		$data1 = json_decode($json1, true);
+		$data2 = json_decode($json2, true);
+
+		if (json_last_error() !== JSON_ERROR_NONE) {
+			// If JSON parsing fails, fall back to string comparison
+			return $this->generateStringDiff($json1, $json2);
+		}
+
+		return $this->compareArrays($data1, $data2);
+	}
+
+	private function compareArrays($arr1, $arr2, $path = '') {
+		$diff = [];
+
+		foreach ($arr1 as $key => $value) {
+			$currentPath = $path ? "$path.$key" : $key;
+
+			if (!array_key_exists($key, $arr2)) {
+				$diff[] = $this->red . "- $currentPath: " . $this->prettyPrint($value) . $this->reset;
+			} elseif ($value !== $arr2[$key]) {
+				if (is_array($value) && is_array($arr2[$key])) {
+					$subDiff = $this->compareArrays($value, $arr2[$key], $currentPath);
+					$diff = array_merge($diff, $subDiff);
+				} else {
+					$diff[] = $this->yellow . "* $currentPath: " . $this->prettyPrint($value) . " => " . $this->prettyPrint($arr2[$key]) . $this->reset;
+				}
+			}
+		}
+
+		foreach ($arr2 as $key => $value) {
+			$currentPath = $path ? "$path.$key" : $key;
+
+			if (!array_key_exists($key, $arr1)) {
+				$diff[] = $this->green . "+ $currentPath: " . $this->prettyPrint($value) . $this->reset;
+			}
+		}
+
+		return $diff;
+	}
+
+	private function prettyPrint($value) {
+		if (is_array($value)) {
+			return json_encode($value, JSON_PRETTY_PRINT);
+		}
+		return var_export($value, true);
+	}
+
+	private function generateStringDiff($string1, $string2) {
+		$lines1 = explode("\n", $string1);
+		$lines2 = explode("\n", $string2);
+		$diff = [];
+
+		$maxLines = max(count($lines1), count($lines2));
+		for ($i = 0; $i < $maxLines; $i++) {
+			$line1 = $lines1[$i] ?? '';
+			$line2 = $lines2[$i] ?? '';
+
+			if ($line1 !== $line2) {
+				$diff[] = $this->red . "- " . $line1 . $this->reset;
+				$diff[] = $this->green . "+ " . $line2 . $this->reset;
+			}
+		}
+
+		return $diff;
+	}
+
+	private function displayResults($differences) {
+		foreach ($differences as $diff) {
+			$bodyMatches = $diff['comparison']['body_matches'];
+			$headerMatches = $diff['comparison']['headers_match'];
+			$statusMatches = $diff['comparison']['status_match'];
+			$pass = $bodyMatches && $headerMatches && $statusMatches;
+			$passText = $pass ? "PASS" : "FAIL";
+
+			echo $this->colorize($pass, "{$passText} {$diff['method']}:{$diff['url']}\n");
+			if (!$bodyMatches) {
+				echo "Body:\n";
+				foreach ($diff['comparison']['body_diff'] as $line) {
+					echo "  $line\n";
+				}
+			}
+			if (!$headerMatches) {
+				echo "Header:\n";
+				foreach ($diff['comparison']['header_diff'] as $headerDiff) {
+					echo "  $headerDiff\n";
+				}
+			}
+			if (!$statusMatches) {
+				echo "Status:\n";
+				echo "  " . $this->red . "- " . $diff['comparison']['status_diff']['original'] . $this->reset . "\n";
+				echo "  " . $this->green . "+ " . $diff['comparison']['status_diff']['new'] . $this->reset . "\n";
+			}
+			echo "--------------------\n";
+		}
+	}
+
+	private function colorize($pass, $message) {
+		return $pass ? $this->green . $message . $this->reset : $this->red . $message . $this->reset;
+	}
+}
+
+$vcr = new VCR();
+$vcr->run();
